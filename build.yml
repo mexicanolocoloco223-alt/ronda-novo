@@ -1,0 +1,431 @@
+name: Gerar APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - name: Gerar projeto Android
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p 
+          cat > build.gradle.kts <<'RONDAS_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          RONDAS_EOF
+          mkdir -p 
+          cat > settings.gradle.kts <<'RONDAS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Rondas"
+          include(":app")
+          RONDAS_EOF
+          mkdir -p 
+          cat > gradle.properties <<'RONDAS_EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          RONDAS_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'RONDAS_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.lucas.rondas"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.lucas.rondas"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          RONDAS_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'RONDAS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <application android:label="Rondas" android:allowBackup="true" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask" android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".ShiftService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="shift_timer"/>
+                  </service>
+                  <receiver android:name=".AlarmReceiver" android:exported="false"/>
+              </application>
+          </manifest>
+          RONDAS_EOF
+          mkdir -p app/src/main/java/com/lucas/rondas
+          cat > app/src/main/java/com/lucas/rondas/Main.kt <<'RONDAS_EOF'
+          package com.lucas.rondas
+
+          import android.Manifest
+          import android.app.*
+          import android.content.*
+          import android.content.pm.PackageManager
+          import android.media.*
+          import android.net.Uri
+          import android.os.*
+          import android.provider.Settings
+          import android.webkit.*
+
+          object Core {
+              const val CH_ON = "plantao"; const val CH_AL = "alarme"; const val ID_ON = 1; const val ID_AL = 2
+              fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("r", Context.MODE_PRIVATE)
+              fun channels(c: Context) {
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH_ON, "Plantao ativo", NotificationManager.IMPORTANCE_LOW))
+                  val a = NotificationChannel(CH_AL, "Alarme de ronda", NotificationManager.IMPORTANCE_HIGH)
+                  a.setSound(null, null); a.enableVibration(false)
+                  nm.createNotificationChannel(a)
+              }
+              fun times(c: Context): List<Long> = prefs(c).getString("t", "")!!.split(",").mapNotNull { it.toLongOrNull() }
+              fun hm(t: Long): String {
+                  val k = java.util.Calendar.getInstance(); k.timeInMillis = t
+                  return "%02d:%02d".format(k.get(java.util.Calendar.HOUR_OF_DAY), k.get(java.util.Calendar.MINUTE))
+              }
+              fun openPI(c: Context, alarm: Boolean): PendingIntent {
+                  val i = Intent(c, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                  if (alarm) i.putExtra("alarm", true)
+                  return PendingIntent.getActivity(c, if (alarm) 11 else 10, i, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+              }
+              fun ongoing(c: Context): Notification {
+                  val v = prefs(c).getInt("v", 1)
+                  val nx = times(c).firstOrNull { it > System.currentTimeMillis() }
+                  val b = Notification.Builder(c, CH_ON).setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setOngoing(true).setOnlyAlertOnce(true).setContentIntent(openPI(c, false))
+                      .setContentTitle("Vigilante $v - Plantao ativo")
+                  if (nx != null) {
+                      b.setContentText("Proxima ronda as " + hm(nx)).setUsesChronometer(true).setChronometerCountDown(true).setShowWhen(true).setWhen(nx)
+                  } else b.setContentText("Sem mais rondas esta noite")
+                  val ex = Bundle(); ex.putBoolean("android.requestPromotedOngoing", true); b.addExtras(ex)
+                  return b.build()
+              }
+              fun refresh(c: Context) {
+                  if (prefs(c).getBoolean("on", false)) c.getSystemService(NotificationManager::class.java).notify(ID_ON, ongoing(c))
+              }
+              fun alarmPI(c: Context, i: Int, t: Long): PendingIntent =
+                  PendingIntent.getBroadcast(c, 100 + i, Intent(c, AlarmReceiver::class.java).putExtra("t", t), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+              fun cancelAll(c: Context) {
+                  val am = c.getSystemService(AlarmManager::class.java)
+                  for (i in 0 until 30) {
+                      PendingIntent.getBroadcast(c, 100 + i, Intent(c, AlarmReceiver::class.java), PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE)?.let { am.cancel(it) }
+                  }
+              }
+              fun start(c: Context, v: Int, ts: List<Long>) {
+                  cancelAll(c); channels(c)
+                  prefs(c).edit().putBoolean("on", true).putInt("v", v).putString("t", ts.joinToString(",")).apply()
+                  val am = c.getSystemService(AlarmManager::class.java)
+                  ts.forEachIndexed { i, t ->
+                      if (t > System.currentTimeMillis()) am.setAlarmClock(AlarmManager.AlarmClockInfo(t, openPI(c, false)), alarmPI(c, i, t))
+                  }
+                  c.startForegroundService(Intent(c, ShiftService::class.java))
+              }
+              fun end(c: Context) {
+                  cancelAll(c); Player.stop()
+                  prefs(c).edit().putBoolean("on", false).apply()
+                  c.stopService(Intent(c, ShiftService::class.java))
+                  val nm = c.getSystemService(NotificationManager::class.java)
+                  nm.cancel(ID_ON); nm.cancel(ID_AL)
+              }
+              fun showAlarm(c: Context) {
+                  val n = Notification.Builder(c, CH_AL).setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setContentTitle("HORA DA RONDA!").setContentText("Toque para confirmar")
+                      .setCategory(Notification.CATEGORY_ALARM).setAutoCancel(true)
+                      .setContentIntent(openPI(c, true)).setFullScreenIntent(openPI(c, true), true).build()
+                  c.getSystemService(NotificationManager::class.java).notify(ID_AL, n)
+              }
+          }
+
+          object Player {
+              private var rt: Ringtone? = null
+              private var vib: Vibrator? = null
+              private val h = Handler(Looper.getMainLooper())
+              fun start(c: Context) {
+                  stop()
+                  val aa = AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+                  try {
+                      val r = RingtoneManager.getRingtone(c, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))
+                      r.audioAttributes = aa
+                      if (Build.VERSION.SDK_INT >= 28) r.isLooping = true
+                      r.play(); rt = r
+                  } catch (e: Exception) {}
+                  try {
+                      val v = c.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      v.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 700, 300, 700, 300, 700, 1200), 0), aa)
+                      vib = v
+                  } catch (e: Exception) {}
+                  h.postDelayed({ stop() }, 120000)
+              }
+              fun stop() {
+                  h.removeCallbacksAndMessages(null)
+                  try { rt?.stop() } catch (e: Exception) {}
+                  try { vib?.cancel() } catch (e: Exception) {}
+                  rt = null; vib = null
+              }
+          }
+
+          class AlarmReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  Core.channels(c)
+                  Player.start(c.applicationContext)
+                  Core.showAlarm(c)
+                  Core.refresh(c)
+              }
+          }
+
+          class ShiftService : Service() {
+              private val h = Handler(Looper.getMainLooper())
+              private val loop = object : Runnable {
+                  override fun run() { Core.refresh(this@ShiftService); h.postDelayed(this, 30000) }
+              }
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  Core.channels(this)
+                  startForeground(Core.ID_ON, Core.ongoing(this))
+                  h.removeCallbacks(loop); h.postDelayed(loop, 30000)
+                  return START_STICKY
+              }
+              override fun onDestroy() { h.removeCallbacks(loop); super.onDestroy() }
+          }
+
+          class MainActivity : Activity() {
+              private lateinit var wv: WebView
+              private var loaded = false
+              private var pending = false
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  window.statusBarColor = 0xFF070B14.toInt(); window.navigationBarColor = 0xFF070B14.toInt()
+                  Core.channels(this)
+                  wv = WebView(this); wv.setBackgroundColor(0xFF070B14.toInt()); setContentView(wv)
+                  wv.settings.javaScriptEnabled = true; wv.settings.domStorageEnabled = true
+                  wv.addJavascriptInterface(Bridge(), "Android")
+                  wv.webViewClient = object : WebViewClient() {
+                      override fun onPageFinished(v: WebView, u: String) { loaded = true; flush() }
+                  }
+                  wv.loadUrl("file:///android_asset/index.html")
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  handle(intent)
+              }
+              override fun onNewIntent(i: Intent) { super.onNewIntent(i); setIntent(i); handle(i) }
+              private fun handle(i: Intent?) {
+                  if (i?.getBooleanExtra("alarm", false) == true) {
+                      setShowWhenLocked(true); setTurnScreenOn(true)
+                      pending = true; flush(); i.removeExtra("alarm")
+                  }
+              }
+              private fun flush() {
+                  if (loaded && pending) { pending = false; wv.evaluateJavascript("window.alarmFromNative&&alarmFromNative()", null) }
+              }
+              @Deprecated("back")
+              override fun onBackPressed() { moveTaskToBack(true) }
+              inner class Bridge {
+                  @JavascriptInterface fun start(v: Int, ts: String) {
+                      Core.start(applicationContext, v, ts.split(",").mapNotNull { it.toLongOrNull() })
+                      runOnUiThread {
+                          val pm = getSystemService(PowerManager::class.java)
+                          if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                              try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
+                          }
+                      }
+                  }
+                  @JavascriptInterface fun end() { Core.end(applicationContext) }
+                  @JavascriptInterface fun stopAlarm() {
+                      Player.stop(); getSystemService(NotificationManager::class.java).cancel(Core.ID_AL)
+                  }
+                  @JavascriptInterface fun test() { Player.start(applicationContext) }
+              }
+          }
+          RONDAS_EOF
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/index.html <<'RONDAS_EOF'
+          <!DOCTYPE html>
+          <html lang="pt-BR"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <meta name="theme-color" content="#070b14">
+          <title>Rondas</title>
+          <style>
+          :root{--bg:#070b14;--sf:rgba(255,255,255,.06);--sf2:rgba(255,255,255,.1);--bd:rgba(255,255,255,.1);--tx:#f2f5ff;--mu:#8e9ab8;--a:#5b8cff;--g:#2ee59d;--r:#ff5470;--y:#ffc857;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+          @media (prefers-color-scheme:light){:root:not([data-theme="dark"]){--bg:#eef2fa;--sf:rgba(255,255,255,.85);--sf2:#e4e9f5;--bd:rgba(20,30,60,.12);--tx:#111a33;--mu:#5c6989}}
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html{scroll-padding-top:env(safe-area-inset-top,0px)}
+          body{margin:0;min-height:100vh;color:var(--tx);font:16px/1.35 system-ui,-apple-system,Roboto,sans-serif;background:radial-gradient(900px 500px at 85% -10%,rgba(91,140,255,.28),transparent 60%),radial-gradient(700px 400px at -10% 30%,rgba(46,229,157,.14),transparent 60%),var(--bg);padding:16px 16px 100px}
+          main{max-width:520px;margin:auto}
+          .card{background:var(--sf);border:1px solid var(--bd);border-radius:26px;padding:18px;margin-bottom:14px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+          .h{display:flex;justify-content:space-between;align-items:center;margin:2px 4px 16px}
+          .h h1{font-size:22px;margin:0;letter-spacing:-.02em}.h small{color:var(--mu);display:block;font-size:13px;margin-top:2px}
+          .dot{display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:700;padding:8px 13px;border-radius:99px;background:var(--sf2);color:var(--mu)}
+          .dot i{width:9px;height:9px;border-radius:50%;background:var(--mu)}
+          .dot.on{color:var(--g)}.dot.on i{background:var(--g);box-shadow:0 0 0 0 var(--g);animation:pu 1.6s infinite}
+          @keyframes pu{70%{box-shadow:0 0 0 9px transparent}}
+          .seg{display:grid;grid-template-columns:1fr 1fr;background:var(--sf2);border-radius:16px;padding:4px;gap:4px}
+          .seg button{border:0;background:none;color:var(--mu);font:inherit;font-weight:700;padding:13px;border-radius:12px;transition:.2s}
+          .seg button.sel{background:linear-gradient(135deg,var(--a),#8a6bff);color:#fff;box-shadow:0 6px 18px rgba(91,140,255,.4)}
+          .ring{position:relative;width:240px;height:240px;margin:6px auto 4px}
+          .ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+          .ring circle{fill:none;stroke-width:12;stroke-linecap:round}
+          .ring .bg{stroke:var(--sf2)}.ring .fg{stroke:url(#gr);stroke-dasharray:597;stroke-dashoffset:597;transition:stroke-dashoffset 1s linear}
+          .ring .in{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+          .cd{font-size:50px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.03em;line-height:1}
+          .mu{color:var(--mu);font-size:14px}
+          .pill{display:inline-block;margin-top:10px;padding:7px 14px;border-radius:99px;font-size:12px;font-weight:800;letter-spacing:.06em}
+          .pill.me{background:rgba(46,229,157,.16);color:var(--g)}.pill.po{background:rgba(91,140,255,.18);color:var(--a)}.pill.off{background:var(--sf2);color:var(--mu)}
+          .c{text-align:center}
+          .btn{width:100%;border:0;font:inherit;font-weight:800;font-size:17px;padding:18px;border-radius:18px;color:#04140d;background:linear-gradient(135deg,var(--g),#7af0c4);box-shadow:0 10px 28px rgba(46,229,157,.35);transition:transform .1s}
+          .btn:active{transform:scale(.98)}
+          .btn.stop{color:#fff;background:linear-gradient(135deg,var(--r),#ff8a5b);box-shadow:0 10px 28px rgba(255,84,112,.35)}
+          .ghost{width:100%;font:inherit;font-weight:600;padding:14px;border-radius:16px;border:1px solid var(--bd);background:var(--sf2);color:var(--tx);margin-top:10px}
+          .tg{display:flex;align-items:center;justify-content:space-between;padding:14px 4px;border-top:1px solid var(--bd);font-weight:600}
+          .tg:first-of-type{border-top:0}
+          .sw{width:50px;height:30px;border-radius:99px;background:var(--sf2);position:relative;transition:.2s;border:0;flex:none}
+          .sw::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;transition:.2s}
+          .sw.on{background:var(--g)}.sw.on::after{left:23px}
+          .ttl{font-size:12px;letter-spacing:.12em;font-weight:800;color:var(--mu);text-transform:uppercase;margin:0 0 12px 2px}
+          .row{display:flex;align-items:center;gap:12px;padding:13px 14px;margin-bottom:8px;border-radius:16px;background:var(--sf2);border:1px solid transparent}
+          .row .t{font-size:19px;font-weight:800;font-variant-numeric:tabular-nums;width:64px}
+          .row .n{flex:1;font-size:14px;color:var(--mu)}
+          .row .b{font-size:11px;font-weight:800;letter-spacing:.05em;padding:6px 10px;border-radius:99px;background:rgba(91,140,255,.18);color:var(--a)}
+          .row.me .b{background:rgba(46,229,157,.16);color:var(--g)}
+          .row.me{border-left:4px solid var(--g)}.row:not(.me){border-left:4px solid var(--a)}
+          .row.nx{border-color:var(--y)}.row.dn{opacity:.45}.row.dn .t{text-decoration:line-through}
+          .tabs{position:fixed;left:14px;right:14px;bottom:calc(12px + env(safe-area-inset-bottom,0px));max-width:492px;margin:auto;display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--sf);border:1px solid var(--bd);border-radius:22px;padding:5px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}
+          .tabs button{border:0;background:none;color:var(--mu);font:inherit;font-weight:700;padding:13px;border-radius:17px}
+          .tabs button.sel{background:var(--sf2);color:var(--tx)}
+          input[type=text]{flex:1;min-width:0;padding:15px;border-radius:14px;border:1px solid var(--bd);background:var(--sf2);color:var(--tx);font:inherit}
+          .add{border:0;background:var(--a);color:#fff;font-size:26px;font-weight:700;width:54px;border-radius:14px}
+          .x{border:0;background:none;color:var(--mu);font-size:18px;padding:6px 8px}
+          .empty{padding:22px;text-align:center;color:var(--mu)}
+          .hide{display:none!important}
+          .cr{text-align:center;color:var(--mu);font-size:13px;margin:18px 0 6px}.cr b{display:block;margin-top:4px;font-size:14px;letter-spacing:.08em;background:linear-gradient(90deg,var(--a),var(--g));-webkit-background-clip:text;background-clip:text;color:transparent}
+          .ov{position:fixed;inset:0;z-index:99;display:none;align-items:center;justify-content:center;padding:22px;background:rgba(0,0,0,.6)}
+          .ov.show{display:flex}
+          .box{width:100%;max-width:400px;background:var(--bg);border:1px solid var(--bd);border-radius:28px;padding:26px;text-align:center}
+          .box h2{margin:6px 0 8px;font-size:24px}.box p{color:var(--mu);margin:0 0 20px}
+          .box .btn+.ghost{margin-top:10px}
+          #al{background:linear-gradient(160deg,#d81b4a,#7a0f2e);animation:fl .9s infinite}
+          @keyframes fl{50%{filter:brightness(.7)}}
+          #al .box{background:none;border:0;color:#fff}#al .box p{color:#ffd7df;font-size:20px}#al h2{font-size:38px}
+          #al .btn{background:#fff;color:#111;box-shadow:none}
+          </style></head><body><main>
+          <div class="h"><div><h1>Controle de Rondas</h1><small id="sub"></small></div><div class="dot" id="dot"><i></i><span>Fora</span></div></div>
+
+          <div id="p1">
+           <div class="card"><p class="ttl">Quem é você?</p>
+            <div class="seg"><button id="v1" onclick="setV(1)">Vigilante 1</button><button id="v2" onclick="setV(2)">Vigilante 2</button></div></div>
+
+           <div class="card c">
+            <div class="ring"><svg viewBox="0 0 220 220"><defs><linearGradient id="gr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#2ee59d"/></linearGradient></defs><circle class="bg" cx="110" cy="110" r="95"/><circle class="fg" id="fg" cx="110" cy="110" r="95"/></svg>
+             <div class="in"><div class="mu" id="lbl">Próxima ronda</div><div class="cd" id="cd">--:--</div><div class="pill off" id="pill">—</div></div></div>
+            <div class="mu" id="who" style="margin-top:8px"></div>
+            <div class="mu" id="mine" style="margin-top:4px;font-size:13px"></div>
+           </div>
+
+           <div class="card">
+            <button id="shift" class="btn" onclick="toggleShift()">Iniciar plantão</button>
+            <div style="height:8px"></div>
+            <div class="tg"><span>Bati o ponto de entrada</span><button class="sw" id="cin" onclick="tg('cin')"></button></div>
+            <div class="tg"><span>Bati o ponto de saída</span><button class="sw" id="cout" onclick="tg('cout')"></button></div>
+            <button class="ghost" onclick="testar()">🔔 Testar alerta e vibração</button>
+           </div>
+
+           <div class="card"><p class="ttl">Escala · 40 em 40 min</p><div id="list"></div></div>
+          </div>
+
+          <div id="p2" class="hide">
+           <div class="card"><p class="ttl">Chaves do plantão</p>
+            <div style="display:flex;gap:8px"><input type="text" id="kn" placeholder="Ex: Portão 2, Sala TI..." onkeydown="if(event.key==='Enter')addK()"><button class="add" onclick="addK()">+</button></div>
+            <div id="keys" style="margin-top:12px"></div></div>
+          </div>
+          <div class="cr">Criado por<b>LUCAS GABRIEL CIDRAL</b></div>
+          </main>
+          <div class="tabs"><button id="t1" class="sel" onclick="tab(1)">⏱ Rondas</button><button id="t2" onclick="tab(2)">🔑 Chaves</button></div>
+
+          <div class="ov" id="al"><div class="box"><div style="font-size:60px">🚨</div><h2>HORA DA RONDA!</h2><p id="alt"></p><button class="btn" onclick="ack()">Confirmar ronda</button></div></div>
+          <div class="ov" id="cf"><div class="box"><div style="font-size:44px">🏁</div><h2>Finalizar plantão?</h2><p>Os alertas serão desligados até você iniciar de novo.</p><button class="btn stop" onclick="endShift()">Sim, finalizar</button><button class="ghost" onclick="$('cf').classList.remove('show')">Cancelar</button></div></div>
+
+          <script>
+          var S={v:1,on:false,cin:false,cout:false,keys:[],done:{},fired:{}};
+          try{Object.assign(S,JSON.parse(localStorage.getItem('rondas2')||'{}'))}catch(e){}
+          function save(){try{localStorage.setItem('rondas2',JSON.stringify(S))}catch(e){}}
+          function $(i){return document.getElementById(i)}
+          function p2(n){return String(n).padStart(2,'0')}
+          function base(){var d=new Date();if(d.getHours()<12)d.setDate(d.getDate()-1);d.setHours(22,0,0,0);return d}
+          function rounds(){var b=base(),a=[];for(var i=0;i<12;i++)a.push({i:i,t:new Date(b.getTime()+i*2400000),v:i%2?2:1,k:b.toDateString()+i});return a}
+          function hm(d){return p2(d.getHours())+':'+p2(d.getMinutes())}
+          function fmt(ms){var s=Math.max(0,Math.floor(ms/1000)),h=Math.floor(s/3600);return(h?h+':':'')+p2(Math.floor(s%3600/60))+':'+p2(s%60)}
+          function setV(n){S.v=n;save();render();nat()}
+          function tg(k){S[k]=!S[k];save();render()}
+          function tab(n){$('p1').classList.toggle('hide',n!=1);$('p2').classList.toggle('hide',n!=2);$('t1').className=n==1?'sel':'';$('t2').className=n==2?'sel':''}
+          var ac,wl,vib,cur=null,nk='';
+          function unlock(){try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();ac.resume()}catch(e){}
+           try{if('Notification' in window&&Notification.permission==='default')Notification.requestPermission()}catch(e){}
+           try{navigator.wakeLock&&navigator.wakeLock.request('screen').then(function(l){wl=l}).catch(function(){})}catch(e){}}
+          function toggleShift(){
+           if(S.on){$('cf').classList.add('show');return}
+           unlock();S.on=true;S.cin=false;S.cout=false;S.done={};S.fired={};save();render();tick();nat()}
+          function endShift(){$('cf').classList.remove('show');S.on=false;S.fired={};stopAl();if(window.Android)Android.end();try{wl&&wl.release()}catch(e){}save();render();tick()}
+          function toggleDone(k){S.done[k]=!S.done[k];save();render()}
+          function addK(){var v=$('kn').value.trim();if(!v)return;S.keys.push({n:v,ok:false});$('kn').value='';save();render()}
+          function delK(i){S.keys.splice(i,1);save();render()}
+          function chK(i){S.keys[i].ok=!S.keys[i].ok;save();render()}
+          function render(){
+           $('v1').className=S.v==1?'sel':'';$('v2').className=S.v==2?'sel':'';
+           var b=$('shift');b.className='btn'+(S.on?' stop':'');b.textContent=S.on?'■ Finalizar plantão':'▶ Iniciar plantão';
+           $('dot').className='dot'+(S.on?' on':'');$('dot').lastChild.textContent=S.on?'Plantão ativo':'Fora do plantão';
+           $('sub').textContent='Vigilante '+S.v+' · 22:00 às 05:20';
+           $('cin').className='sw'+(S.cin?' on':'');$('cout').className='sw'+(S.cout?' on':'');
+           $('list').innerHTML=rounds().map(function(r,i){var me=r.v==S.v,dn=S.done[r.k];
+            return '<div class="row'+(me?' me':'')+(dn?' dn':'')+(r.k==nk?' nx':'')+'"'+(me?' onclick="toggleDone(\''+r.k+'\')"':'')+'><span class="t">'+hm(r.t)+'</span><span class="n">Ronda '+(i+1)+'</span><span class="b">'+(dn&&me?'✓ FEITA':me?'SUA RONDA':'PARCEIRO')+'</span></div>'}).join('');
+           $('keys').innerHTML=S.keys.map(function(k,i){return '<div class="row'+(k.ok?' dn':'')+'"><button class="sw'+(k.ok?' on':'')+'" onclick="chK('+i+')"></button><span style="flex:1;font-weight:600">'+k.n.replace(/</g,'&lt;')+'</span><button class="x" onclick="delK('+i+')">✕</button></div>'}).join('')||'<div class="empty">Nenhuma chave adicionada ainda.</div>'}
+          function stopAl(){if(window.Android)Android.stopAlarm();clearInterval(vib);try{navigator.vibrate&&navigator.vibrate(0)}catch(e){}$('al').classList.remove('show')}
+          function alarm(r){cur=r;$('alt').textContent='Ronda das '+hm(r.t)+' · Vigilante '+r.v;$('al').classList.add('show');
+           function go(){if(window.Android)return;try{navigator.vibrate&&navigator.vibrate([600,200,600,200,600])}catch(e){}
+            try{if(ac){var o=ac.createOscillator(),g=ac.createGain();o.connect(g);g.connect(ac.destination);o.frequency.value=880;g.gain.value=.4;o.start();o.stop(ac.currentTime+.5)}}catch(e){}}
+           go();clearInterval(vib);vib=setInterval(go,2000);
+           try{if(!window.Android&&'Notification' in window&&Notification.permission==='granted')new Notification('🚨 Hora da ronda!',{body:'Ronda das '+hm(r.t),requireInteraction:true,vibrate:[600,200,600]})}catch(e){}}
+          function testar(){unlock();if(window.Android)Android.test();alarm({t:new Date(),v:S.v,k:'teste'})}
+          function ack(){stopAl();if(cur&&cur.k!=='teste'){S.done[cur.k]=true;save();render()}cur=null}
+          function tick(){
+           var now=Date.now(),rs=rounds(),nx=rs.filter(function(r){return r.t>now})[0],mine=rs.filter(function(r){return r.v==S.v}),mn=mine.filter(function(r){return r.t>now})[0];
+           var nn=nx?nx.k:'';if(nn!==nk){nk=nn;render()}
+           var p=$('pill'),fg=$('fg');
+           if(nx){var m=nx.v==S.v;p.className='pill '+(S.on?(m?'me':'po'):'off');p.textContent=!S.on?'SEM ALERTAS':m?'SUA VEZ':'VEZ DO PARCEIRO';
+            $('lbl').textContent='Ronda das '+hm(nx.t);$('cd').textContent=fmt(nx.t-now);
+            fg.style.strokeDashoffset=597*((nx.t-now)/2400000);$('who').textContent='Designado: Vigilante '+nx.v}
+           else{p.className='pill off';p.textContent='FIM';$('lbl').textContent='Rondas';$('cd').textContent='--:--';fg.style.strokeDashoffset=597;$('who').textContent='Sem mais rondas esta noite'}
+           $('mine').textContent=mn?'Sua próxima: '+hm(mn.t)+' · em '+fmt(mn.t-now):'';
+           if(S.on)mine.forEach(function(r){var d=now-r.t;if(d>=0&&d<300000&&!S.fired[r.k]){S.fired[r.k]=1;save();alarm(r)}})}
+          document.addEventListener('visibilitychange',tick);
+          function nat(){if(!window.Android||!S.on)return;var t=rounds().filter(function(r){return r.v==S.v&&r.t>Date.now()}).map(function(r){return r.t.getTime()});Android.start(S.v,t.join(','))}
+          window.alarmFromNative=function(){var n=Date.now(),r=rounds().filter(function(x){return x.v==S.v&&n-x.t>=-60000&&n-x.t<600000})[0];alarm(r||{t:new Date(),v:S.v,k:'x'})};
+          render();tick();setInterval(tick,1000);nat();
+          </script></body></html>
+          RONDAS_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Compilar
+        run: cd proj && gradle assembleDebug --no-daemon
+      - name: Publicar APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Rondas APK ${{ github.run_number }}
+          files: proj/app/build/outputs/apk/debug/app-debug.apk
